@@ -56,6 +56,7 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "bert-base-uncased"
 _CONFIG_FOR_DOC = "BertConfig"
+_TOKENIZER_FOR_DOC = "BertTokenizer"
 
 # TokenClassification docstring
 _CHECKPOINT_FOR_TOKEN_CLASSIFICATION = "dbmdz/bert-large-cased-finetuned-conll03-english"
@@ -185,7 +186,8 @@ class BertEmbeddings(nn.Module):
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
-
+        #####------------------------------------------
+        self.sentence_segment_embeddings = nn.Embedding(2, config.hidden_size)
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -202,6 +204,8 @@ class BertEmbeddings(nn.Module):
         input_ids: Optional[torch.LongTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        #####------------------------------------------
+        seg_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values_length: int = 0,
     ) -> torch.Tensor:
@@ -225,12 +229,15 @@ class BertEmbeddings(nn.Module):
                 token_type_ids = buffered_token_type_ids_expanded
             else:
                 token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
-
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
+        #if seg_ids is None:
+        #    print("NONE")
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
-
-        embeddings = inputs_embeds + token_type_embeddings
+        #####------------------------------------------
+        seg_embeddings = self.sentence_segment_embeddings(seg_ids)
+        #####------------------------------------------ 
+        embeddings = inputs_embeds + token_type_embeddings + seg_embeddings
         if self.position_embedding_type == "absolute":
             position_embeddings = self.position_embeddings(position_ids)
             embeddings += position_embeddings
@@ -308,7 +315,6 @@ class BertSelfAttention(nn.Module):
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
-        use_cache = past_key_value is not None
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
             # Further calls to cross_attention layer can then reuse all cross-attention
@@ -323,16 +329,10 @@ class BertSelfAttention(nn.Module):
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            query_length, key_length = query_layer.shape[2], key_layer.shape[2]
-            if use_cache:
-                position_ids_l = torch.tensor(key_length - 1, dtype=torch.long, device=hidden_states.device).view(
-                    -1, 1
-                )
-            else:
-                position_ids_l = torch.arange(query_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
-            position_ids_r = torch.arange(key_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
+            seq_length = hidden_states.size()[1]
+            position_ids_l = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
+            position_ids_r = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
             distance = position_ids_l - position_ids_r
-
             positional_embedding = self.distance_embedding(distance + self.max_position_embeddings - 1)
             positional_embedding = positional_embedding.to(dtype=query_layer.dtype)  # fp16 compatibility
 
@@ -575,13 +575,6 @@ class BertEncoder(nn.Module):
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
 
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
-
         next_decoder_cache = () if use_cache else None
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
@@ -591,6 +584,12 @@ class BertEncoder(nn.Module):
             past_key_value = past_key_values[i] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
+
+                if use_cache:
+                    logger.warning(
+                        "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                    )
+                    use_cache = False
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
@@ -821,7 +820,7 @@ BERT_INPUTS_DOCSTRING = r"""
         input_ids (`torch.LongTensor` of shape `({0})`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`BertTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -911,6 +910,7 @@ class BertModel(BertPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=BaseModelOutputWithPoolingAndCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
@@ -920,6 +920,7 @@ class BertModel(BertPreTrainedModel):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1009,11 +1010,12 @@ class BertModel(BertPreTrainedModel):
         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
-
+        #print(seg_ids)
         embedding_output = self.embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
             token_type_ids=token_type_ids,
+            seg_ids = seg_ids,
             inputs_embeds=inputs_embeds,
             past_key_values_length=past_key_values_length,
         )
@@ -1053,9 +1055,6 @@ class BertModel(BertPreTrainedModel):
     BERT_START_DOCSTRING,
 )
 class BertForPreTraining(BertPreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias", r"cls.predictions.decoder.weight"]
-    _tied_weights_keys = ["predictions.decoder.bias", "cls.predictions.decoder.weight"]
-
     def __init__(self, config):
         super().__init__(config)
 
@@ -1078,6 +1077,7 @@ class BertForPreTraining(BertPreTrainedModel):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1106,10 +1106,10 @@ class BertForPreTraining(BertPreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, BertForPreTraining
+        >>> from transformers import BertTokenizer, BertForPreTraining
         >>> import torch
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        >>> tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         >>> model = BertForPreTraining.from_pretrained("bert-base-uncased")
 
         >>> inputs = tokenizer("Hello, my dog is cute", return_tensors="pt")
@@ -1125,6 +1125,7 @@ class BertForPreTraining(BertPreTrainedModel):
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            seg_ids = seg_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
@@ -1160,9 +1161,9 @@ class BertForPreTraining(BertPreTrainedModel):
     """Bert Model with a `language modeling` head on top for CLM fine-tuning.""", BERT_START_DOCSTRING
 )
 class BertLMHeadModel(BertPreTrainedModel):
+
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
-    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias", r"cls.predictions.decoder.weight"]
-    _tied_weights_keys = ["predictions.decoder.bias", "cls.predictions.decoder.weight"]
+    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1184,6 +1185,7 @@ class BertLMHeadModel(BertPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=CausalLMOutputWithCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
@@ -1193,6 +1195,7 @@ class BertLMHeadModel(BertPreTrainedModel):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1237,6 +1240,7 @@ class BertLMHeadModel(BertPreTrainedModel):
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            seg_ids = seg_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
@@ -1273,37 +1277,30 @@ class BertLMHeadModel(BertPreTrainedModel):
             cross_attentions=outputs.cross_attentions,
         )
 
-    def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, use_cache=True, **model_kwargs
-    ):
+    def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **model_kwargs):
         input_shape = input_ids.shape
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_shape)
 
-        # cut decoder_input_ids if past_key_values is used
-        if past_key_values is not None:
+        # cut decoder_input_ids if past is used
+        if past is not None:
             input_ids = input_ids[:, -1:]
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
-            "use_cache": use_cache,
-        }
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "past_key_values": past}
 
-    def _reorder_cache(self, past_key_values, beam_idx):
+    def _reorder_cache(self, past, beam_idx):
         reordered_past = ()
-        for layer_past in past_key_values:
+        for layer_past in past:
             reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
         return reordered_past
 
 
 @add_start_docstrings("""Bert Model with a `language modeling` head on top.""", BERT_START_DOCSTRING)
 class BertForMaskedLM(BertPreTrainedModel):
+
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
-    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias", r"cls.predictions.decoder.weight"]
-    _tied_weights_keys = ["predictions.decoder.bias", "cls.predictions.decoder.weight"]
+    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1328,6 +1325,7 @@ class BertForMaskedLM(BertPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=MaskedLMOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1339,6 +1337,7 @@ class BertForMaskedLM(BertPreTrainedModel):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1362,6 +1361,7 @@ class BertForMaskedLM(BertPreTrainedModel):
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            seg_ids = seg_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
@@ -1429,6 +1429,7 @@ class BertForNextSentencePrediction(BertPreTrainedModel):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1451,10 +1452,10 @@ class BertForNextSentencePrediction(BertPreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, BertForNextSentencePrediction
+        >>> from transformers import BertTokenizer, BertForNextSentencePrediction
         >>> import torch
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        >>> tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         >>> model = BertForNextSentencePrediction.from_pretrained("bert-base-uncased")
 
         >>> prompt = "In Italy, pizza served in formal settings, such as at a restaurant, is presented unsliced."
@@ -1481,6 +1482,7 @@ class BertForNextSentencePrediction(BertPreTrainedModel):
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            seg_ids = seg_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
@@ -1535,6 +1537,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_SEQUENCE_CLASSIFICATION,
         output_type=SequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1545,6 +1548,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
@@ -1566,6 +1570,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            seg_ids = seg_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
@@ -1636,6 +1641,7 @@ class BertForMultipleChoice(BertPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length"))
     @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=MultipleChoiceModelOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1645,6 +1651,7 @@ class BertForMultipleChoice(BertPreTrainedModel):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
+        seg_ids:Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1665,6 +1672,7 @@ class BertForMultipleChoice(BertPreTrainedModel):
         input_ids = input_ids.view(-1, input_ids.size(-1)) if input_ids is not None else None
         attention_mask = attention_mask.view(-1, attention_mask.size(-1)) if attention_mask is not None else None
         token_type_ids = token_type_ids.view(-1, token_type_ids.size(-1)) if token_type_ids is not None else None
+        seg_ids = seg_ids.view(-1, seg_ids.size(-1)) if seg_ids is not None else None
         position_ids = position_ids.view(-1, position_ids.size(-1)) if position_ids is not None else None
         inputs_embeds = (
             inputs_embeds.view(-1, inputs_embeds.size(-2), inputs_embeds.size(-1))
@@ -1677,6 +1685,7 @@ class BertForMultipleChoice(BertPreTrainedModel):
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
+            seg_ids = seg_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
@@ -1715,6 +1724,7 @@ class BertForMultipleChoice(BertPreTrainedModel):
     BERT_START_DOCSTRING,
 )
 class BertForTokenClassification(BertPreTrainedModel):
+
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
 
     def __init__(self, config):
@@ -1733,6 +1743,7 @@ class BertForTokenClassification(BertPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_TOKEN_CLASSIFICATION,
         output_type=TokenClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1744,6 +1755,7 @@ class BertForTokenClassification(BertPreTrainedModel):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1762,6 +1774,7 @@ class BertForTokenClassification(BertPreTrainedModel):
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            seg_ids = seg_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
@@ -1799,7 +1812,9 @@ class BertForTokenClassification(BertPreTrainedModel):
     """,
     BERT_START_DOCSTRING,
 )
+
 class BertForQuestionAnswering(BertPreTrainedModel):
+
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
 
     def __init__(self, config):
@@ -1814,6 +1829,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_QA,
         output_type=QuestionAnsweringModelOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1827,6 +1843,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1852,6 +1869,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            seg_ids = seg_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
